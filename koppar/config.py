@@ -2,7 +2,7 @@
 
 import os
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 # the package identifier in KiCad's Plugin and Content Manager
 PACKAGE_ID = "ai.koppar.kicad"
 
