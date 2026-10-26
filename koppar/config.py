@@ -3,6 +3,8 @@
 import os
 
 VERSION = "0.1.0"
+# the package identifier in KiCad's Plugin and Content Manager
+PACKAGE_ID = "ai.koppar.kicad"
 
 DEFAULT_SERVER = "https://tools.koppar.ai"
 # the account API (board workspace tools) is served from the app's host
@@ -16,8 +18,9 @@ def servers():
     another server (a local one, while developing); a packaged plugin ignores it."""
     dev = None if PACKAGED else os.environ.get("KOPPAR_SERVER", "").strip().rstrip("/")
     return (dev, dev) if dev else (DEFAULT_SERVER, ACCOUNT_SERVER)
-# where an account API key is created (Settings > API keys)
-API_KEYS_URL = "https://app.koppar.ai/settings"
+# where an account API key is created (Settings > API keys); `ref` records the account as
+# one the plugin brought in, when it is made from this link
+API_KEYS_URL = "https://app.koppar.ai/settings?ref=kicad-plugin"
 HOMEPAGE_URL = "https://koppar.ai"
 
 # the largest board file the server takes

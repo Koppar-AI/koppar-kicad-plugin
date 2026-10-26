@@ -604,8 +604,9 @@ class KopparWindow(wx.Frame):
     def _make_clients(self):
         server, account_server = servers()
         self.key = api_key_of(self.settings)
-        self.tools_client = KopparClient(server, self.key, board_io.kicad_version())
-        self.account = KopparClient(account_server, self.key, board_io.kicad_version()) if self.key else None
+        install = board_io.install_source()
+        self.tools_client = KopparClient(server, self.key, board_io.kicad_version(), install)
+        self.account = KopparClient(account_server, self.key, board_io.kicad_version(), install) if self.key else None
         self.workspace = Workspace(self.account, self.board_file) if self.account else None
 
     def _header(self):
