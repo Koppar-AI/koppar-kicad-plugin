@@ -88,10 +88,12 @@ def user_agent(kicad_version=None):
 
 
 class KopparClient:
-    def __init__(self, server, api_key=None, kicad_version=None):
+    def __init__(self, server, api_key=None, kicad_version=None, install=None):
         self.server = server.rstrip("/")
         self.api_key = (api_key or "").strip() or None
         self.user_agent = user_agent(kicad_version)
+        # where the plugin was installed from (board_io.install_source), None from a script
+        self.install = install
 
     # -- transport ---------------------------------------------------------
 
@@ -104,6 +106,8 @@ class KopparClient:
             headers["Content-Type"] = "application/json"
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.install:
+            headers["X-Koppar-Install"] = self.install
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         context = ssl_context() if url.startswith("https:") else None
         try:
@@ -197,6 +201,8 @@ class KopparClient:
         headers = {"User-Agent": self.user_agent, "Accept": "text/event-stream", "Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.install:
+            headers["X-Koppar-Install"] = self.install
         req = urllib.request.Request(url, data=json.dumps({"content": content}).encode("utf-8"), headers=headers, method="POST")
         context = ssl_context() if url.startswith("https:") else None
         try:

@@ -8,6 +8,7 @@ them.
 """
 
 import io
+import json
 import os
 import re
 import tempfile
@@ -15,7 +16,7 @@ import zipfile
 
 import pcbnew
 
-from . import legacy
+from . import config, legacy
 
 
 def kicad_version():
@@ -23,6 +24,30 @@ def kicad_version():
         return pcbnew.Version()
     except Exception:
         return None
+
+
+def install_source():
+    """Where this copy of the plugin was installed from, sent as X-Koppar-Install.
+
+    KiCad records every package it installed in installed_packages.json, in its user settings
+    folder, with the repository it came from: 'pcm:<repository id>' (the Plugin and Content
+    Manager; KiCad's official repository is 46f88614eade3439, the head of the sha256 of its
+    URL), 'file' (Install from File), 'manual' (copied into the plugins folder, so not in the
+    record), 'source' (a checkout, not a package). None when the record cannot be read.
+    """
+    if not config.PACKAGED:
+        return "source"
+    try:
+        path = os.path.join(pcbnew.SETTINGS_MANAGER.GetUserSettingsPath(), "installed_packages.json")
+        with open(path, "r", encoding="utf-8") as f:
+            entries = json.load(f).get("packages") or []
+    except Exception:
+        return None
+    for entry in entries:
+        if (entry.get("package") or {}).get("identifier") == config.PACKAGE_ID:
+            repo = str(entry.get("repository_id") or "").strip().lower()
+            return f"pcm:{repo}" if re.fullmatch(r"[0-9a-f]{1,64}", repo) else "file"
+    return "manual"
 
 
 def kicad_major():
