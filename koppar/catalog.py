@@ -1,17 +1,17 @@
 """The tasks the Koppar window offers, in the words a board designer uses.
 
 A task is one server tool (or the anonymous Autoroute) with a title, a line
-that says what it does, the button's verb, a few options with real labels,
-and how its result comes back:
+that says what it does, the button's verb, the few options a board designer
+sets, with real labels, and how its result comes back:
 
     copper     the board's tracks, vias and new pours are replaced by the workspace's
     placement  footprint positions, rotations and sides, then the copper
     report     nothing changes on the board: the result is shown
     download   a file (e.g. STEP) is saved beside the board
 
-Every other option the server publishes for the tool is under Advanced, built
-from its JSON Schema, so nothing the MCP server or the CLI can do is out of
-reach. Left out on purpose: what KiCad does by hand as well (outline,
+Only those options are shown: what else a tool takes (tuning, and inputs that
+KiCad already says, such as fixed parts: a locked footprint stays) is for an
+agent through the MCP server or the CLI. Left out on purpose: what KiCad does by hand as well (outline,
 keepouts, zones, exact placement, silkscreen, footprint swaps, design rules:
 the plugin cannot write the open project's rules), and the design/BOM/order
 tools, which need a design with a netlist rather than a board.
@@ -19,8 +19,9 @@ tools, which need a design with a netlist rather than a board.
 
 from collections import namedtuple
 
-# kind: nets | toggle | minutes
+# kind: nets | parts | toggle | minutes
 #   nets: default scope "all", "open", "selected" or "power"; arg None means "which nets come back"
+#   parts: which footprints may move, all unlocked ones or the ones selected in KiCad (sent as refs)
 #   toggle: sends `extra` (default true) when on and nothing when off, so the server's default applies
 #   minutes: a time budget in minutes, sent in seconds; extra = (min, max)
 Option = namedtuple("Option", "kind arg label default extra", defaults=(None,))
@@ -45,7 +46,8 @@ TASKS = [
          "Route only the nets you pick, around everything already on the board.",
          "Route", "route_board", "copper", True, [
              Option("nets", "nets", "Nets", "selected"),
-             Option("toggle", "fewest_vias", "Fewest vias (slower)", False),
+             Option("toggle", "pairs_first", "Route differential pairs first", False),
+             Option("toggle", "vias_in_pads", "Allow vias in pads (the board is ordered with filled vias)", False, "allow"),
          ], "Routing"),
     Task("finish", ROUTE, "Finish open nets",
          "Close the connections still open on a routed board, leaving the rest of the copper alone.",
@@ -62,17 +64,21 @@ TASKS = [
          "Remove tracks and vias, from the whole board or from the nets you pick. Locked copper stays.",
          "Rip up", "ripup_routing", "copper", True, [
              Option("nets", "nets", "Nets", "all"),
+             Option("toggle", "zones", "Also remove copper pours", False),
+             Option("toggle", "include_locked", "Also remove locked copper", False),
          ], "Ripping up"),
     Task("auto_place", PLACE, "Auto-place",
          "Place the parts by connectivity: connectors on the edges, decoupling beside its IC, nothing overlapping. "
          "Locked parts stay where they are.",
          "Place", "auto_place", "placement", True, [
-             Option("toggle", "two_sided", "Use both sides of the board", False),
-             Option("toggle", "refine", "Refine the placement afterwards (annealing)", True, "anneal"),
+             Option("parts", "refs", "Parts that move", "all"),
+             Option("toggle", "two_sided", "Small two-pad parts may go on the bottom", False),
+             Option("toggle", "refine", "Refine the placement afterwards", True, "anneal"),
          ], "Placing"),
     Task("anneal", PLACE, "Refine a dense placement",
          "Nudge and swap parts to shorten connections and open routing room, keeping your arrangement.",
          "Refine", "anneal_place", "placement", True, [
+             Option("parts", "refs", "Parts that move", "all"),
              Option("toggle", "bottom_any", "Small SMD parts may go on the bottom", False),
          ], "Refining"),
     Task("polish_vias", IMPROVE, "Fewer vias",

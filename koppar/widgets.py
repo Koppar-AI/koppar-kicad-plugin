@@ -259,6 +259,22 @@ def _clip_email(email, most=28):
     return name[: most - len(domain) - 2] + "\u2026@" + domain
 
 
+class Glyph(Painted):
+    """An icon at its size, centred in a box `height` tall (a line of the text beside it), so
+    it sits on that line's middle at any scale. wx.StaticBitmap shows a high-DPI icon at
+    twice its size on macOS."""
+
+    def __init__(self, parent, theme, icon, size, colour, height=None):
+        super().__init__(parent, theme)
+        self.icon, self.size, self.colour = icon, size, colour
+        self.SetMinSize((size, max(size, height or 0)))
+
+    def draw(self, gc, w, h):
+        bmp = self.theme.icon(self.icon, self.size, self.colour, self)
+        if bmp.IsOk():
+            gc.DrawBitmap(bmp, (w - self.size) / 2, (h - self.size) / 2, self.size, self.size)
+
+
 class IconButton(Painted):
     def __init__(self, parent, theme, icon, on_click, tooltip="", size=32, filled=False):
         super().__init__(parent, theme, focusable=True)

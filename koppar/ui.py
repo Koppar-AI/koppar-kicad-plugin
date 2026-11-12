@@ -12,6 +12,7 @@ import json
 import os
 import threading
 import time
+import traceback
 import webbrowser
 from collections import namedtuple
 
@@ -19,8 +20,8 @@ import pcbnew
 import wx
 from wx.lib.scrolledpanel import ScrolledPanel
 
-from . import board_io, catalog, projects, rich, summary
-from .api import ApiError, KopparClient
+from . import board_io, catalog, feedback, precheck, projects, rich, summary, updates
+from .api import ApiError, KopparClient, ssl_context
 from .config import ACCOUNT_SERVER, API_KEYS_URL, MAX_BOARD_BYTES, POLL_INTERVAL_S, ROUTED_ARTIFACT, VERSION, servers
 from .settings import (
     api_key_of,
@@ -42,6 +43,7 @@ from .widgets import (
     Card,
     Chip,
     Composer,
+    Glyph,
     MinutesStepper,
     Painted,
     RichView,
@@ -53,13 +55,15 @@ from .widgets import (
     _extent,
     _gc,
 )
-from .workspace import Workspace
+from .workspace import Workspace, apply_fixes, route_result
 
 APPLY_ACTION_NAME = "Koppar: apply result"
 HERE = os.path.dirname(os.path.abspath(__file__))
 COLUMN = 640  # the content column, DIP
 NavItem = namedtuple("NavItem", "id title icon subtitle")
 CHAT = NavItem("chat", "Ask Koppar", "message-square", "Ask about this board, change it, or design a new one")
+# the tasks that route: the board is checked first for what a route cannot fix (precheck.py)
+CHECKED_TASKS = {"autoroute", "route_nets", "finish", "repair"}
 
 
 def pcb_frame():
@@ -465,71 +469,65 @@ class NetScope(wx.Panel):
         self._update()
 
 
-class SchemaFields(wx.Panel):
-    """Every option the server publishes for a tool, from its JSON Schema. Blank
-    means the server's default."""
+class PartScope(wx.Panel):
+    """Which parts may move: every unlocked one, or the ones selected in the PCB editor. A locked
+    footprint never moves, so locking it in KiCad is how a part is held in place."""
 
-    def __init__(self, parent, theme, schema, skip):
+    LABELS = {"all": "All unlocked parts", "selected": "Selected in KiCad"}
+
+    def __init__(self, parent, theme, default):
         super().__init__(parent)
         self.SetBackgroundColour(parent.GetBackgroundColour())
-        self.fields = []
-        required = set(schema.get("required") or [])
-        grid = wx.FlexGridSizer(0, 2, self.FromDIP(10), self.FromDIP(16))
-        grid.AddGrowableCol(1)
-        for name, prop in (schema.get("properties") or {}).items():
-            if name in skip or name in catalog.HIDDEN_ARGS:
-                continue
-            widget, kind = self._widget(theme, prop)
-            cell = wx.BoxSizer(wx.VERTICAL)
-            cell.Add(widget, 0, wx.EXPAND)
-            if prop.get("description"):
-                cell.Add(text(self, theme, prop["description"], 9, colour="muted", wrap=400), 0, wx.TOP, self.FromDIP(3))
-            grid.Add(text(self, theme, summary.humanize(name) + (" (required)" if name in required else ""), 9.5, 600, "ink2"),
-                     0, wx.TOP, self.FromDIP(5))
-            grid.Add(cell, 1, wx.EXPAND)
-            self.fields.append((name, prop, kind, widget))
-        if not self.fields:
-            grid.Add(text(self, theme, "No other options.", 9.5, colour="muted"), 0)
-        self.SetSizer(grid)
+        self.scope = default if default in self.LABELS else "all"
+        box = wx.BoxSizer(wx.VERTICAL)
+        self.choice = Segmented(self, theme, list(self.LABELS.items()), self.scope, self._chose)
+        box.Add(self.choice, 0)
+        self.count = text(self, theme, "", 9.5, colour="muted")
+        box.Add(self.count, 0, wx.TOP, self.FromDIP(8))
+        self.SetSizer(box)
+        self._update()
 
-    def _widget(self, theme, prop):
-        kind = prop.get("type")
-        if kind == "boolean":
-            w = wx.Choice(self, choices=["Server default", "Yes", "No"])
-            w.SetSelection(0)
-            return w, "boolean"
-        if prop.get("enum"):
-            w = wx.Choice(self, choices=["Server default"] + [str(v) for v in prop["enum"]])
-            w.SetSelection(0)
-            return w, "enum"
-        if kind == "array" and (prop.get("items") or {}).get("type") == "string":
-            w = wx.TextCtrl(self)
-            w.SetHint("Comma-separated")
-            return w, "strings"
-        if kind in ("number", "integer", "string"):
-            return wx.TextCtrl(self), kind
-        w = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(-1, self.FromDIP(54)))
-        w.SetHint("JSON")
-        w.SetFont(theme.mono(9))
-        return w, "json"
+    def _chose(self, key):
+        self.scope = key
+        self._update()
 
-    def values(self):
-        out = {}
-        for name, prop, kind, w in self.fields:
-            if kind in ("boolean", "enum"):
-                i = w.GetSelection()
-                if i > 0:
-                    out[name] = (i == 1) if kind == "boolean" else prop["enum"][i - 1]
-                continue
-            raw = w.GetValue().strip()
-            if not raw:
-                continue
-            try:
-                out[name] = {"integer": int, "number": float, "json": json.loads,
-                             "strings": lambda s: [x.strip() for x in s.split(",") if x.strip()]}.get(kind, str)(raw)
-            except ValueError:
-                raise ValueError(f"{summary.humanize(name)}: " + {"integer": "a whole number", "number": "a number"}.get(kind, "JSON") + " is expected.")
-        return out
+    @staticmethod
+    def _footprints():
+        """(selected refs, locked refs among them, unlocked count on the board)."""
+        selected, locked, unlocked = [], [], 0
+        try:
+            board = pcbnew.GetBoard()
+            for fp in board.GetFootprints():
+                is_locked = fp.IsLocked()
+                unlocked += 0 if is_locked else 1
+                if fp.IsSelected():
+                    (locked if is_locked else selected).append(fp.GetReference())
+        except Exception:
+            pass
+        return sorted(selected), sorted(locked), unlocked
+
+    def refs(self):
+        """The refs to send; None for every unlocked part (the server's default)."""
+        return None if self.scope == "all" else self._footprints()[0]
+
+    def _update(self):
+        selected, locked, unlocked = self._footprints()
+        if self.scope == "all":
+            label = f"{unlocked} unlocked {'part' if unlocked == 1 else 'parts'} may move. Lock a part in KiCad to keep it where it is."
+        elif not selected:
+            label = "No unlocked part is selected in the PCB editor. Select the parts to move there first."
+        else:
+            shown = ", ".join(selected[:6]) + (f" and {len(selected) - 6} more" if len(selected) > 6 else "")
+            label = f"{len(selected)} {'part' if len(selected) == 1 else 'parts'}: {shown}"
+        if self.scope == "selected" and locked:
+            label += f" ({', '.join(locked[:4])}{' and more' if len(locked) > 4 else ''} {'is' if len(locked) == 1 else 'are'} locked and stay{'s' if len(locked) == 1 else ''}.)"
+        self.count.SetLabel(label)
+        self.count.Wrap(self.FromDIP(COLUMN - 60))
+        self.Layout()
+        self.GetParent().Layout()
+
+    def refresh(self):
+        self._update()
 
 
 # -- the window ----------------------------------------------------------------
@@ -556,7 +554,7 @@ class KopparWindow(wx.Frame):
         self.show_all_details = False
         self.controls = {}
         self.scope = None
-        self.advanced = None
+        self.parts = None
         self.chat_busy = False
         self.chat_loaded_for = None
         # new designs the chat started: where each was opened, and the card that shows it
@@ -565,6 +563,9 @@ class KopparWindow(wx.Frame):
         self.design_polls = set()
         self.chat_empty = True
         self.session = load_session(board_file) or {}
+        # a newer release, when the last check found one (updates.py)
+        self.update_offer = updates.offer(settings.get("update_available"), board_io.kicad_major())
+        self.update_installed = None
         self._make_clients()
 
         t = self.theme
@@ -591,6 +592,7 @@ class KopparWindow(wx.Frame):
         self.Bind(wx.EVT_TIMER, lambda e: self._tick(), self.timer)
         self.Bind(wx.EVT_CLOSE, self._on_close)
         self.Bind(wx.EVT_CHAR_HOOK, self._on_key)
+        self.Bind(wx.EVT_ACTIVATE, self._on_activate)
         self.SetMinSize(self.FromDIP(wx.Size(960, 620)))
         self._show_account()
         self._refresh_nav()
@@ -598,6 +600,7 @@ class KopparWindow(wx.Frame):
         self.Show()
         self._load_account()
         self._restore()
+        self._check_updates()
 
     # -- header and account ------------------------------------------------
 
@@ -624,11 +627,15 @@ class KopparWindow(wx.Frame):
         row.AddSpacer(self.FromDIP(18))
         row.Add(text(self.header, t, os.path.basename(self.board_file), 9.5, colour="muted", family="mono"), 0, wx.ALIGN_CENTER_VERTICAL)
         row.AddStretchSpacer()
+        self.update_btn = Button(self.header, t, "Update", self._on_update, kind="ghost", icon="arrow-up", small=True)
+        row.Add(self.update_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, self.FromDIP(6))
         self.runs_chip = Chip(self.header, t, "", "neutral", "circuit-board")
         row.Add(self.runs_chip, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, self.FromDIP(10))
         self.web_btn = Button(self.header, t, "Open in Koppar", lambda: webbrowser.open(self.workspace.record["web_url"]),
                               kind="ghost", icon="external-link", small=True)
         row.Add(self.web_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, self.FromDIP(6))
+        self.feedback_btn = Button(self.header, t, "Feedback", lambda: self._on_feedback(), kind="ghost", icon="message-square", small=True)
+        row.Add(self.feedback_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, self.FromDIP(6))
         self.key_btn = AccountButton(self.header, t, self._on_account)
         row.Add(self.key_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, self.FromDIP(16))
         self.header.SetSizer(row)
@@ -695,6 +702,7 @@ class KopparWindow(wx.Frame):
             self.runs_chip.Hide()
         has_ws = bool(self.workspace and self.workspace.record and self.workspace.record.get("web_url"))
         self.web_btn.Show(has_ws)
+        self._show_update()
         user = (self.account_info or {}).get("user") or {}
         if not self.account:
             self.key_btn.show_none()
@@ -763,7 +771,7 @@ class KopparWindow(wx.Frame):
         page, t = self.task_page, self.theme
         page.Freeze()
         page.reset()
-        self.controls, self.scope, self.advanced = {}, None, None
+        self.controls, self.scope, self.parts = {}, None, None
 
         hero = Card(page, t, pad=24)
         top = wx.BoxSizer(wx.HORIZONTAL)
@@ -781,8 +789,10 @@ class KopparWindow(wx.Frame):
             effect += " Runs on a copy of the board in your Koppar account."
         row = wx.BoxSizer(wx.HORIZONTAL)
         icon = {"copper": "undo-2", "placement": "undo-2", "report": "search"}.get(task.mode, "folder-open")
-        row.Add(wx.StaticBitmap(hero, bitmap=t.icon(icon, self.FromDIP(15), t["muted"], self)), 0, wx.TOP | wx.RIGHT, self.FromDIP(2))
-        row.Add(text(hero, t, effect, 9.5, colour="muted", wrap=COLUMN - 90), 1, wx.LEFT, self.FromDIP(6))
+        note = text(hero, t, effect, 9.5, colour="muted", wrap=COLUMN - 90)
+        # the icon on the middle of the note's first line
+        row.Add(Glyph(hero, t, icon, self.FromDIP(15), t["muted"], height=note.GetCharHeight()), 0, wx.RIGHT, self.FromDIP(8))
+        row.Add(note, 1)
         hero.inner.Add(row, 0, wx.TOP, self.FromDIP(12))
         page.add(hero)
 
@@ -800,6 +810,10 @@ class KopparWindow(wx.Frame):
                 form.inner.Add(text(form, t, opt.label, 9.5, 600, "ink2"), 0, wx.BOTTOM, self.FromDIP(8))
                 self.scope = NetScope(form, t, self.census, opt.default, with_power=opt.default == "power")
                 form.inner.Add(self.scope, 0, wx.EXPAND | wx.BOTTOM, self.FromDIP(18))
+            elif opt.kind == "parts":
+                form.inner.Add(text(form, t, opt.label, 9.5, 600, "ink2"), 0, wx.BOTTOM, self.FromDIP(8))
+                self.parts = PartScope(form, t, opt.default)
+                form.inner.Add(self.parts, 0, wx.EXPAND | wx.BOTTOM, self.FromDIP(18))
             elif opt.kind == "toggle":
                 value = self.settings.get(opt.arg, opt.default) if task.id == "autoroute" else opt.default
                 sw = Switch(form, t, opt.label, value)
@@ -813,28 +827,6 @@ class KopparWindow(wx.Frame):
                 r.Add(stepper, 0, wx.ALIGN_CENTER_VERTICAL)
                 form.inner.Add(r, 0, wx.BOTTOM, self.FromDIP(14))
                 self.controls[opt.arg] = (opt, stepper)
-
-        tool = self._server_tool(task)
-        if tool is not None:
-            curated = {o.arg for o in task.options if o.arg}
-            holder = wx.Panel(form)
-            holder.SetBackgroundColour(t["surface"])
-            self.advanced = SchemaFields(holder, t, tool.get("input_schema") or {}, curated)
-            hb = wx.BoxSizer(wx.VERTICAL)
-            hb.Add(self.advanced, 0, wx.EXPAND | wx.TOP, self.FromDIP(10))
-            holder.SetSizer(hb)
-            holder.Hide()
-
-            def toggle():
-                holder.Show(not holder.IsShown())
-                more.set_label("Fewer options" if holder.IsShown() else "More options")
-                more.icon = "chevron-down" if holder.IsShown() else "chevron-right"
-                page.done()
-
-            more = Button(form, t, "More options", toggle, kind="ghost", icon="chevron-right", small=True)
-            form.inner.Add(more, 0, wx.LEFT, -self.FromDIP(8))
-            form.inner.Add(holder, 0, wx.EXPAND)
-
         foot = wx.BoxSizer(wx.HORIZONTAL)
         go = Button(form, t, self._verb(task), lambda: self._run(task), kind="primary",
                     icon=catalog.ICONS.get(task.id) if task.mode != "report" else None)
@@ -843,7 +835,7 @@ class KopparWindow(wx.Frame):
                 if task.id == "autoroute" else "Ctrl+Z after Apply puts the board back." if task.mode in ("copper", "placement") else "")
         if hint:
             foot.Add(text(form, t, hint, 9, colour="muted", wrap=360), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, self.FromDIP(16))
-        form.inner.Add(foot, 0, wx.TOP, self.FromDIP(18 if task.options or tool else 0))
+        form.inner.Add(foot, 0, wx.TOP, self.FromDIP(18 if task.options else 0))
         page.add(form)
         page.done()
         page.Thaw()
@@ -890,8 +882,12 @@ class KopparWindow(wx.Frame):
                         args["all"] = True
                 else:
                     args[nets_opt.arg] = nets
-        if self.advanced is not None:
-            args.update(self.advanced.values())
+        if self.parts is not None:
+            refs = self.parts.refs()
+            if refs is not None:
+                if not refs:
+                    raise ValueError(self.parts.count.GetLabel())
+                args["refs"] = refs
         if task.tool == "widen_nets" and not args.get("nets"):
             raise ValueError("Pick the nets to widen.")
         return args
@@ -984,10 +980,147 @@ class KopparWindow(wx.Frame):
         if len(snapshot.encode("utf-8")) > MAX_BOARD_BYTES:
             wx.MessageBox("The board file is over 20 MB, the most the server takes.", task.title, wx.OK | wx.ICON_WARNING, self)
             return
-        if task.id == "autoroute":
-            self._run_autoroute(task, snapshot)
+        # the project with the rules as the editor holds them (Board Setup changes not saved yet included)
+        payload = board_io.project_payload(pcbnew.GetBoard(), self.board_file)
+        if task.id in CHECKED_TASKS:
+            self._check_board(task, args, snapshot, payload)
         else:
-            self._run_tool(task, args, board_io.project_zip(self.board_file, snapshot))
+            self._dispatch(task, args, snapshot, payload)
+
+    def _tool_named(self, name):
+        return next((t for t in (self.listing or []) if t["name"] == name), None)
+
+    def _dispatch(self, task, args, snapshot, payload, fixes=None):
+        """Run the task: an account route in the board's workspace, Autoroute without an account on
+        the tools server, every other task in the workspace. `fixes` (precheck.fix_plan) run first."""
+        if task.id == "autoroute":
+            if self.workspace and self._tool_named("route_board"):
+                self._run_account_route(task, snapshot, payload, fixes)
+            else:
+                self._run_autoroute(task, snapshot, payload)
+        else:
+            self._run_tool(task, args, board_io.project_zip(self.board_file, snapshot, payload), fixes=fixes)
+
+    # -- the board check before a route ------------------------------------------
+
+    def _check_board(self, task, args, snapshot, payload):
+        """KiCad's DRC on the board as sent, before the route: what a route cannot fix is said first."""
+        stem = os.path.splitext(os.path.basename(self.board_file))[0]
+        folder = os.path.join(project_work_dir(self.board_file), "check")
+        os.makedirs(folder, exist_ok=True)
+        for ext, data in (("kicad_pcb", snapshot), ("kicad_pro", payload.get("project")), ("kicad_dru", payload.get("rules"))):
+            path = os.path.join(folder, f"{stem}.{ext}")
+            if data:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(data)
+            elif os.path.exists(path):
+                os.remove(path)
+        board = pcbnew.GetBoard()
+        pads = {fp.GetReference(): len(fp.Pads()) for fp in board.GetFootprints()}
+        locked = {fp.GetReference() for fp in board.GetFootprints() if fp.IsLocked()}
+        cli = precheck.kicad_cli(pcbnew)
+        server_drc = bool(self.workspace and self._tool_named("run_drc"))
+        if not cli and not server_drc:
+            # KiCad 7 without kicad-cli and no account: route as before
+            self._dispatch(task, args, snapshot, payload)
+            return
+        self._start_run(task, ["Check"])
+        self._stage(0, "Checking the board with KiCad's design-rule check")
+
+        def work():
+            if cli:
+                report = precheck.run_drc(cli, folder, stem)
+            else:
+                self.workspace.push(board_io.project_zip(self.board_file, snapshot, payload))
+                view = self.workspace.run("run_drc", {"max_violations": 500})
+                report = precheck.from_server_report(view.get("result"))
+            return precheck.classify(report)
+
+        def done(found, error):
+            self._end_run()
+            if error or not found:
+                # the check is help, not a gate: a check that could not run does not stop the route
+                print(f"[Koppar] board check skipped: {error.detail if error else 'no report'}")
+                self._dispatch(task, args, snapshot, payload)
+                return
+            acked = (self.settings.get("check_ack") or {}).get(self.board_file)
+            if not precheck.serious(found) or acked == precheck.fingerprint(found):
+                self._dispatch(task, args, snapshot, payload)
+                return
+            self._show_check(task, args, snapshot, payload, found,
+                             precheck.fix_plan(found, pads_of=lambda r: pads.get(r, 0), locked=locked))
+
+        self._bg(work, done)
+
+    def _show_check(self, task, args, snapshot, payload, found, plan):
+        """What the check found, and the choice: fix on the account's copy then route, route anyway, or go back."""
+        page, t = self.result_page, self.theme
+        self.pending = None
+        self.result_for = task
+        self.result_summary = None
+        page.Freeze()
+        page.reset()
+        card = Card(page, t, pad=24)
+        top = wx.BoxSizer(wx.HORIZONTAL)
+        top.Add(IconTile(card, t, "triangle-alert", "warn"), 0, wx.RIGHT, self.FromDIP(16))
+        heads = wx.BoxSizer(wx.VERTICAL)
+        heads.Add(text(card, t, task.title, 9.5, 500, "muted"), 0)
+        n_short, n_over = len(found["shorts"]), len(found["overlaps"])
+        bits = []
+        if n_short:
+            bits.append(f"{n_short} {'short' if n_short == 1 else 'shorts'}")
+        if n_over:
+            bits.append(f"{n_over} overlapping {'part' if n_over == 1 else 'parts'}")
+        if found["conflicts"]:
+            bits.append(f"{len(found['conflicts'])} net class {'rule' if len(found['conflicts']) == 1 else 'rules'} the parts cannot meet")
+        headline = "Before routing: " + ", ".join(bits)
+        heads.Add(text(card, t, headline, 17, 600, family="display", wrap=COLUMN - 120), 0, wx.TOP, self.FromDIP(1))
+        top.Add(heads, 1, wx.ALIGN_CENTER_VERTICAL)
+        card.inner.Add(top, 0, wx.EXPAND)
+        card.inner.Add(text(card, t, "A route works around the board as it is: these stay on the board after it, "
+                                     "and the route is judged with them.", 10, colour="ink2", wrap=COLUMN - 60), 0, wx.TOP, self.FromDIP(14))
+        can_fix = bool(self.workspace and (plan["move"] or plan["rip"]) and self._tool_named("anneal_place")
+                       and self._tool_named("ripup_routing") and (task.id != "autoroute" or self._tool_named("route_board")))
+        foot = wx.BoxSizer(wx.HORIZONTAL)
+        if can_fix:
+            what = []
+            if plan["move"]:
+                what.append(f"move {', '.join(plan['move'][:6])}{' and more' if len(plan['move']) > 6 else ''}")
+            if plan["rip"]:
+                what.append(f"remove {len(plan['rip'])} stray {'via or track' if len(plan['rip']) == 1 else 'vias and tracks'}")
+            foot.Add(Button(card, t, "Fix and route", lambda: self._dispatch(task, args, snapshot, payload, fixes=plan),
+                            kind="primary", icon="wrench"), 0, wx.RIGHT, self.FromDIP(8))
+        foot.Add(Button(card, t, "Route anyway", lambda: self._route_anyway(task, args, snapshot, payload, found),
+                        kind="secondary" if can_fix else "primary", icon=catalog.ICONS.get(task.id)), 0, wx.RIGHT, self.FromDIP(8))
+        foot.Add(Button(card, t, "Back to the task", lambda: self._pick(NavItem(task.id, "", "", ""))), 0)
+        card.inner.Add(foot, 0, wx.TOP, self.FromDIP(18))
+        if can_fix:
+            card.inner.Add(text(card, t, "Fix and route " + " and ".join(what) + " on the copy of the board in your Koppar "
+                                         "account, clears the copper where the moved parts were and where they go, then "
+                                         "routes the board. Only those parts move; the result comes back with Apply, as one "
+                                         "undo step.", 9, colour="muted", wrap=COLUMN - 60), 0, wx.TOP, self.FromDIP(10))
+        elif not self.workspace and (plan["move"] or plan["rip"]):
+            card.inner.Add(text(card, t, "With a Koppar account, Koppar moves these parts and removes the stray copper on its "
+                                         "copy of the board before routing.", 9, colour="muted", wrap=COLUMN - 60), 0, wx.TOP, self.FromDIP(10))
+        page.add(card)
+        details = Card(page, t, pad=24)
+        view = RichView(details, t, self._on_link)
+        details.inner.Add(view, 0, wx.EXPAND)
+        page.add(details)
+        details.Layout()
+        view.SetSize((self.FromDIP(COLUMN - 48), -1))
+        view.set_blocks(rich.summary_blocks(_check_sections(found, plan)))
+        page.done()
+        page.Thaw()
+        self.book.SetSelection(2)
+        self.nav.select(task.id)
+
+    def _route_anyway(self, task, args, snapshot, payload, found):
+        acks = dict(self.settings.get("check_ack") or {})
+        acks[self.board_file] = precheck.fingerprint(found)
+        self.settings["check_ack"] = acks
+        save_settings(self.settings)
+        self._dispatch(task, args, snapshot, payload)
 
     def _snapshot(self):
         stem = os.path.splitext(os.path.basename(self.board_file))[0]
@@ -995,7 +1128,7 @@ class KopparWindow(wx.Frame):
 
     # -- Autoroute (the anonymous tools API) -----------------------------------
 
-    def _run_autoroute(self, task, board_text):
+    def _run_autoroute(self, task, board_text, payload=None):
         for arg, (opt, ctrl) in self.controls.items():
             self.settings[arg] = ctrl.GetValue()
         save_settings(self.settings)
@@ -1004,7 +1137,7 @@ class KopparWindow(wx.Frame):
             nets = [n["name"] for n in self.census]
         self._start_run(task, self.ROUTE_STAGES)
         self._stage(0, "Uploading the board")
-        extra = board_io.project_files(self.board_file)
+        extra = payload if payload is not None else board_io.project_files(self.board_file)
 
         def work():
             return self.tools_client.submit_route(board_text, extra.get("project"), extra.get("rules"),
@@ -1116,6 +1249,9 @@ class KopparWindow(wx.Frame):
         self._show_result(task, self.session.get("result"), ctx)
 
     def _on_stop(self):
+        if self.session.get("account_route"):
+            self._stop_account_route()
+            return
         if not self.session.get("job_id"):
             return
         if wx.MessageBox("Stop this run? The server drops it and nothing on the board changes.",
@@ -1135,46 +1271,129 @@ class KopparWindow(wx.Frame):
 
     # -- account tools ---------------------------------------------------------
 
-    def _run_tool(self, task, args, zip_bytes):
-        mode = catalog.mode_of(task.tool, args)
-        self._start_run(task, ["Send", task.running, "Bring back"])
-        self._stage(0, "Sending the board as it is in the editor")
+    def _run_tool(self, task, args, zip_bytes, fixes=None, tool=None, mode=None, result_map=None, pending_nets=None,
+                  on_started=None, push=True, follow=False):
+        """One account task on the board's workspace: send the board, run the fixes the check proposed
+        (only the listed parts move, only the stray copper goes), run the tool, bring the board back."""
+        tool = tool or task.tool
+        mode = mode or catalog.mode_of(tool, args)
+        moves = bool(fixes and fixes.get("move"))
+        if moves:
+            # moved parts bring their copper and their places back
+            mode, pending_nets = "placement", None
+        stages = (["Send"] if push else []) + (["Fix"] if fixes else []) + [task.running, "Bring back"]
+        run_at, back_at = len(stages) - 2, len(stages) - 1
+        self._start_run(task, stages)
+        if push:
+            self._stage(0, "Sending the board as it is in the editor")
 
         def progress(text_, _elapsed):
             text_ = text_ or "running"
-            self._stage(1, text_[:1].upper() + text_[1:])
+            self._stage(run_at, friendly_progress(text_))
 
         def work():
-            self.workspace.push(zip_bytes)
-            self._stage(1, "Working on the board")
-            view = self.workspace.run(task.tool, args, on_progress=progress, is_cancelled=lambda: self.closed)
+            if push:
+                self.workspace.push(zip_bytes)
+            if fixes:
+                self._run_fixes(fixes, 1 if push else 0)
+            self._stage(run_at, "Working on the board")
+            if on_started:
+                on_started()
+            if follow:
+                view = self.workspace.follow(on_progress=progress, is_cancelled=lambda: self.closed)
+            else:
+                view = self.workspace.run(tool, args, on_progress=progress, is_cancelled=lambda: self.closed)
             out = {"view": view}
+            if view.get("status") in ("queued", "running"):
+                return out  # the window closed: the job goes on, and the button picks it up again
             if mode != "report":
-                self._stage(2, "Bringing the result back")
+                self._stage(back_at, "Bringing the result back")
                 out["board"] = self.workspace.fetch("workspace.kicad_pcb")
             return out
 
         def done(out, error):
             self._end_run()
             self._show_account()
+            if self.session.get("account_route"):
+                self.session.pop("account_route", None)
+                save_session(self.board_file, self.session)
+            if error and "stopped by its owner" in (error.detail or ""):
+                self._show_error(task, ApiError(0, "Nothing was changed on the board."), title="Stopped", tone="neutral")
+                return
             if error:
                 self._show_error(task, error)
                 return
             result = out["view"].get("result")
+            if result_map:
+                result = result_map(result)
             ctx = {"nets": args.get("nets")}
             self.pending = None
             if out.get("board"):
-                self.pending = {"source": task.tool, "mode": mode, "result_path": out["board"], "nets": None,
-                                "import_zones": True, "created_at": time.time()}
+                self.pending = {"source": tool, "mode": mode, "result_path": out["board"], "nets": pending_nets,
+                                "import_zones": self.settings.get("import_zones", True) if task.id == "autoroute" else True,
+                                "created_at": time.time()}
                 save_pending(self.board_file, self.pending)
+                if task.id == "autoroute":
+                    try:
+                        if not board_io.is_newer_format(out["board"]):
+                            ctx["census_after"] = board_io.net_census(board_io.load_routed(out["board"]))
+                    except Exception:
+                        pass
             self._show_result(task, result, ctx)
 
         self._bg(work, done)
+
+    def _run_fixes(self, fixes, stage):
+        """The check's fixes on the workspace, on the worker thread (workspace.apply_fixes)."""
+        apply_fixes(self.workspace, fixes, on_stage=lambda text_: self._stage(stage, text_), is_cancelled=lambda: self.closed)
+
+    # -- Autoroute with an account: route_board in the board's workspace -------------
+
+    def _run_account_route(self, task, snapshot, payload, fixes=None, resume=False):
+        """Autoroute in the account: the same workspace (one project per board) as every other
+        account task, so the board, its revisions and the run are in the Koppar app too."""
+        if not resume:
+            for arg, (opt, ctrl) in self.controls.items():
+                self.settings[arg] = ctrl.GetValue()
+            save_settings(self.settings)
+        nets = self.scope.nets() if self.scope else None
+        if nets is None:
+            nets = [n["name"] for n in self.census]
+        args = {"preserve_existing": bool(self.settings.get("preserve_existing", True)),
+                "vias_in_pads": "allow" if self.settings.get("vias_in_pads", False) else "forbid"}
+
+        def started():
+            # the run, for the Stop button and for picking it up after the window closes
+            self.session = {"account_route": {"design_id": self.workspace.design_id, "nets": nets,
+                                              "moved": moved, "started_at": time.time()}}
+            save_session(self.board_file, self.session)
+
+        moved = bool(fixes and fixes.get("move")) or (resume and bool((self.session.get("account_route") or {}).get("moved")))
+        self._run_tool(task, args, None if resume else board_io.project_zip(self.board_file, snapshot, payload),
+                       fixes=None if resume else fixes, tool="route_board", mode="placement" if moved else "copper",
+                       result_map=route_result, pending_nets=None if moved else nets, on_started=None if resume else started,
+                       push=not resume, follow=resume)
+
+    def _stop_account_route(self):
+        if wx.MessageBox("Stop this run? The server stops it and nothing on the board changes.",
+                         "Koppar", wx.YES_NO | wx.ICON_QUESTION, self) != wx.YES:
+            return
+        self.stop_btn.Enable(False)
+
+        def done(_view, error):
+            if error:
+                self.stop_btn.Enable(True)
+                detail = ("This Koppar server cannot stop a run yet: it goes on, and its result comes back here."
+                          if error.status in (400, 404) else error.detail)
+                wx.MessageBox(f"Could not stop the run: {detail}", "Koppar", wx.OK | wx.ICON_ERROR, self)
+
+        self._bg(lambda: self.account.stop_board_job(self.workspace.design_id), done)
 
     # -- result page -----------------------------------------------------------
 
     def _show_result(self, task, result, ctx):
         self.result_for = task
+        self.last_report = self._run_report(task)
         self.applied_text = None
         self.result_summary = summary.summarize(task.id, result, ctx or {})
         self.show_all_details = False
@@ -1191,6 +1410,9 @@ class KopparWindow(wx.Frame):
         if error.status == 402:
             blocks.append({"kind": "p", "spans": [("Add an API key", "link", "action:account"), ("   ", "normal", None),
                                                   ("Create one in the Koppar app", "link", "url:" + API_KEYS_URL)]})
+        self.last_report = self._run_report(task, error)
+        if tone == "bad" and error.status != 402:
+            blocks.append({"kind": "p", "spans": [("Tell Koppar about it", "link", "action:feedback")]})
         self._result_page(task, title or f"{task.title} did not finish", tone, [], blocks)
 
     def _result_page(self, task, headline, tone, tiles, blocks):
@@ -1253,12 +1475,41 @@ class KopparWindow(wx.Frame):
             self.result_page.done()
         elif kind == "action" and value == "account":
             self._on_account()
+        elif kind == "action" and value == "feedback":
+            self._on_feedback(include=True)
         elif kind == "url":
             webbrowser.open(value)
         elif kind == "file":
             open_path(value)
         else:
             show_on_board(kind, value)
+
+    # -- feedback ------------------------------------------------------------
+
+    def _run_report(self, task, error=None):
+        """The details of the run just shown, for the Feedback box (sent only when ticked there)."""
+        account = (self.session or {}).get("account_route") or {}
+        return feedback.report(board_io.kicad_version(), task.id if task else None, error,
+                               job_id=(self.session or {}).get("job_id"),
+                               design_id=account.get("design_id") or (self.workspace.design_id if self.workspace else None))
+
+    def _on_feedback(self, include=False):
+        details = getattr(self, "last_report", None) or feedback.report(board_io.kicad_version())
+        dlg = float_over(FeedbackDialog(self, self.theme, details, include, signed_in=bool(self.key)))
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            body = dlg.payload()
+        finally:
+            dlg.Destroy()
+
+        def done(_result, error):
+            if error:
+                wx.MessageBox(f"The feedback could not be sent: {error.detail}", "Koppar", wx.OK | wx.ICON_ERROR, self)
+            else:
+                wx.MessageBox("Thank you. The Koppar team reads every message.", "Koppar", wx.OK | wx.ICON_INFORMATION, self)
+
+        self._bg(lambda: self.tools_client.send_feedback(body), done)
 
     def _on_apply(self):
         if not self.pending:
@@ -1662,6 +1913,13 @@ class KopparWindow(wx.Frame):
     def _restore(self):
         """Pick a routing job up again: its result when it was downloaded, the run otherwise."""
         s = self.session
+        ar = s.get("account_route")
+        if ar and self.workspace and self.workspace.design_id == ar.get("design_id"):
+            self.task = catalog.task("autoroute")
+            self.nav.select("autoroute")
+            self._run_account_route(self.task, None, None, resume=True)
+            self.run_started = float(ar.get("started_at", time.time()))
+            return
         if not s.get("job_id") or s.get("applied_at"):
             return
         self.task = catalog.task("autoroute")
@@ -1674,6 +1932,101 @@ class KopparWindow(wx.Frame):
             self._stage(1, "Reconnecting to the run")
             self._poll_route()
 
+    # -- updates -------------------------------------------------------------
+
+    def _check_updates(self):
+        """A look for a newer release each time the window opens (on unless switched off), in the
+        background; what the last look found shows meanwhile. With "Install updates automatically"
+        on, a newer release is installed at once, for the next start of the PCB editor."""
+        self._show_update()
+        if not updates.due(self.settings):
+            return
+
+        def done(manifest, error):
+            self.settings["last_update_check"] = time.time()
+            if not error:
+                self.update_offer = updates.offer(manifest, board_io.kicad_major())
+                self.settings["update_available"] = self.update_offer
+            save_settings(self.settings)
+            self._show_update()
+            if self.update_offer and self.settings.get("auto_update"):
+                self._install_update(auto=True)
+
+        self._bg(self.tools_client.plugin_manifest, done)
+
+    def _show_update(self):
+        if self.update_installed:
+            self.update_btn.set_label(f"Restart KiCad for {self.update_installed}")
+            self.update_btn.icon = "refresh-cw"
+            self.update_btn.Show()
+        elif self.update_offer and self.settings.get("check_updates", True):
+            self.update_btn.set_label(f"Update to {self.update_offer['version']}")
+            self.update_btn.icon = "arrow-up"
+            self.update_btn.Show()
+        else:
+            self.update_btn.Hide()
+        self.header.Layout()
+
+    def _on_update(self):
+        if self.update_installed:
+            wx.MessageBox(f"Koppar {self.update_installed} is installed. Close and open the PCB editor to use it.",
+                          "Koppar", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        offer = self.update_offer
+        if not offer:
+            return
+        if not updates.can_update():
+            wx.MessageBox(f"Koppar {offer['version']} is out. This copy runs from a source checkout: update it with git.",
+                          "Koppar", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        notes = (offer.get("notes") or "").strip()
+        ask = f"Install Koppar for KiCad {offer['version']}? (You have {VERSION}.)" + (f"\n\n{notes}" if notes else "") + \
+              "\n\nIt takes effect when the PCB editor next starts. The version you have now is kept, to go back to."
+        if wx.MessageBox(ask, "Update Koppar", wx.YES_NO | wx.ICON_QUESTION, self) != wx.YES:
+            return
+        self._install_update(auto=False)
+
+    def _install_update(self, auto):
+        if self.busy or getattr(self, "_updating", False) or not updates.can_update():
+            return  # never while a run is in flight; the next start tries again
+        offer = self.update_offer
+        self._updating = True
+        self.update_btn.set_label("Updating")
+        self.update_btn.Enable(False)
+        try:
+            settings_dir = pcbnew.SETTINGS_MANAGER.GetUserSettingsPath()
+        except Exception:
+            settings_dir = None
+
+        def work():
+            data = updates.download(offer, ssl_context(), self.tools_client.user_agent)
+            return updates.install(data, offer, kicad_settings_dir=settings_dir)
+
+        def done(version, error):
+            self._updating = False
+            self.update_btn.Enable(True)
+            if error:
+                self._show_update()
+                if not auto:
+                    wx.MessageBox(f"Koppar could not update: {error.detail}", "Koppar", wx.OK | wx.ICON_ERROR, self)
+                return
+            self.update_installed = version
+            self.update_offer = None
+            self.settings["update_available"] = None
+            save_settings(self.settings)
+            self._show_update()
+            if not auto:
+                wx.MessageBox(f"Koppar for KiCad {version} is installed. Close and open the PCB editor to use it.",
+                              "Koppar", wx.OK | wx.ICON_INFORMATION, self)
+
+        def work_wrapped():
+            try:
+                return work()
+            except updates.UpdateError as e:
+                raise ApiError(0, str(e))
+
+        self._bg(work_wrapped, done)
+
     # -- plumbing ----------------------------------------------------------
 
     def _bg(self, work, done):
@@ -1683,10 +2036,21 @@ class KopparWindow(wx.Frame):
                 result, error = work(), None
             except ApiError as e:
                 result, error = None, e
-            except Exception as e:  # a bug must still reach the window
-                result, error = None, ApiError(0, f"{type(e).__name__}: {e}")
+            except Exception as e:  # a bug must still reach the window, and the Feedback box can carry its traceback
+                result, error = None, ApiError(0, f"{type(e).__name__}: {e}", {"traceback": traceback.format_exc()})
             wx.CallAfter(lambda: None if self.closed else done(result, error))
         threading.Thread(target=run, daemon=True).start()
+
+    def _on_activate(self, event):
+        # back from the PCB editor: what is selected there may have changed
+        if event.GetActive() and not self.closed:
+            for scope in (self.scope, self.parts):
+                if scope is not None:
+                    try:
+                        scope.refresh()
+                    except RuntimeError:  # its page was rebuilt meanwhile
+                        pass
+        event.Skip()
 
     def _on_key(self, event):
         if event.GetKeyCode() == wx.WXK_TAB:
@@ -1700,8 +2064,53 @@ class KopparWindow(wx.Frame):
         event.Skip()
 
 
+def _check_sections(found, plan):
+    """The board check's findings as result sections, parts and nets as links."""
+    ref, net = summary.ref_link, summary.net_link
+    sections = []
+    if found["shorts"]:
+        items = []
+        for s in found["shorts"]:
+            nets = s["nets"]
+            if s["cause"] == "parts" and len(s["refs"]) >= 2:
+                line = [ref(s["refs"][0]), " and ", ref(s["refs"][1]), " are on each other: "]
+            elif s["copper"]:
+                c = s["copper"][0]
+                line = [f"A {c['kind'].lower()} of ", net(c["net"]), " touches "] + ([ref(s["refs"][0]), ": "] if s["refs"] else [])
+            else:
+                line = []
+            for i, n in enumerate(nets[:2]):
+                line += ([" and "] if i else []) + [net(n)]
+            items.append(line + [" short"])
+        sections.append({"title": "Shorts", "kind": "bullets", "items": items})
+    if found["overlaps"]:
+        sections.append({"title": "Parts on each other", "kind": "bullets",
+                         "items": [[ref(o["refs"][0]), " and ", ref(o["refs"][1]), " overlap"] for o in found["overlaps"]]})
+    if found["conflicts"]:
+        items = []
+        for c in found["conflicts"]:
+            line = [f"{c['netclass']} asks for {c['clearance_mm']:g} mm; the pads of "]
+            for i, r in enumerate(c["refs"][:8]):
+                line += ([", "] if i else []) + [ref(r)]
+            if len(c["refs"]) > 8:
+                line.append(f" and {len(c['refs']) - 8} more")
+            line.append(f" are as close as {c['closest_mm']:g} mm")
+            items.append(line)
+        sections.append({"title": "Net class clearances the parts cannot meet", "kind": "bullets", "items": items})
+        sections.append({"title": "What to do", "kind": "text", "text":
+                         "No route can meet these: lower the class clearance, or draw a rule area with a smaller "
+                         "clearance at these parts, in Board Setup."})
+    if found["other"]:
+        sections.append({"title": "Other errors", "kind": "table",
+                         "rows": [(k.replace("_", " "), str(v)) for k, v in found["other"].items()]})
+    for line in plan.get("left") or []:
+        if "locked" in line:
+            sections.append({"title": "Locked parts", "kind": "text", "text": line})
+    return sections
+
+
 PROGRESS = [
-    (r"ML router: (\d+) nets? to route, (\d+) kept", lambda m: f"Routing {m[1]} nets, keeping the {m[2]} already connected"),
+    (r"ML router: (\d+) nets? to route, (\d+) (?:already connected and )?kept", lambda m: f"Routing {m[1]} nets, keeping the {m[2]} already connected"),
     (r"ML router: (\d+) nets? to route", lambda m: f"Routing {m[1]} nets"),
     (r"^route$|^starting$", lambda m: "Routing"),
     (r"^fill", lambda m: "Filling the copper pours"),
@@ -1759,6 +2168,63 @@ def show_on_board(kind, value):
         print(f"[Koppar] could not show {kind}:{value}: {e}")
 
 
+class FeedbackDialog(wx.Dialog):
+    """A message and a rating for the Koppar team, and, only when ticked, the last run's details
+    (shown here as they are sent)."""
+
+    RATINGS = ["No rating", "1 (poor)", "2", "3", "4", "5 (great)"]
+
+    def __init__(self, parent, theme, details, include, signed_in):
+        super().__init__(parent, title="Feedback")
+        self.details = details
+        self.SetBackgroundColour(theme["surface"])
+        root = wx.BoxSizer(wx.VERTICAL)
+        pad = self.FromDIP(20)
+        root.Add(text(self, theme, "Tell the Koppar team", 15, 600, family="display"), 0, wx.LEFT | wx.RIGHT | wx.TOP, pad)
+        who = ("It is sent with your Koppar account, so we can answer." if signed_in else
+               "It is sent without your name; add an email address to the message if you would like an answer.")
+        root.AddSpacer(pad // 2)
+        root.Add(text(self, theme, "What worked, what did not, what you would like. We read every message. " + who,
+                      10, colour="ink2", wrap=460), 0, wx.LEFT | wx.RIGHT, pad)
+        self.message = wx.TextCtrl(self, style=wx.TE_MULTILINE, size=(self.FromDIP(460), self.FromDIP(120)))
+        self.message.SetMaxLength(feedback.MESSAGE_MAX_CHARS)
+        root.Add(self.message, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, pad)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(text(self, theme, "Rating", 9.5, 600, "ink2"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, self.FromDIP(12))
+        self.rating = wx.Choice(self, choices=self.RATINGS)
+        self.rating.SetSelection(0)
+        row.Add(self.rating, 0)
+        root.Add(row, 0, wx.LEFT | wx.RIGHT | wx.TOP, pad)
+        self.include = wx.CheckBox(self, label="Include the details of the last run (below; never the board)")
+        self.include.SetValue(bool(include))
+        self.include.SetForegroundColour(theme["ink"])
+        root.Add(self.include, 0, wx.LEFT | wx.RIGHT | wx.TOP, pad)
+        shown = wx.TextCtrl(self, value=json.dumps(details, indent=1), style=wx.TE_MULTILINE | wx.TE_READONLY,
+                            size=(self.FromDIP(460), self.FromDIP(110)))
+        shown.SetFont(wx.Font(wx.FontInfo(8.5).Family(wx.FONTFAMILY_TELETYPE)))
+        shown.ShowPosition(0)
+        root.AddSpacer(pad // 2)
+        root.Add(shown, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, pad)
+        foot = wx.BoxSizer(wx.HORIZONTAL)
+        foot.AddStretchSpacer()
+        foot.Add(Button(self, theme, "Cancel", lambda: self.EndModal(wx.ID_CANCEL)), 0, wx.RIGHT, self.FromDIP(8))
+        foot.Add(Button(self, theme, "Send", self._on_send, kind="primary", icon="message-square"), 0)
+        root.Add(foot, 0, wx.EXPAND | wx.ALL, pad)
+        self.SetSizerAndFit(root)
+        self.CentreOnParent()
+        self.message.SetFocus()
+
+    def _on_send(self):
+        if not self.message.GetValue().strip() and self.rating.GetSelection() == 0:
+            wx.MessageBox("Write a message or pick a rating.", "Feedback", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        self.EndModal(wx.ID_OK)
+
+    def payload(self):
+        return feedback.payload(self.message.GetValue(), self.rating.GetSelection() or None,
+                                self.details if self.include.GetValue() else None)
+
+
 class AccountDialog(wx.Dialog):
     """The API key."""
 
@@ -1768,9 +2234,10 @@ class AccountDialog(wx.Dialog):
         root = wx.BoxSizer(wx.VERTICAL)
         pad = self.FromDIP(20)
         root.Add(text(self, theme, "Your Koppar account", 15, 600, family="display"), 0, wx.LEFT | wx.RIGHT | wx.TOP, pad)
+        root.AddSpacer(pad // 2)
         root.Add(text(self, theme, "An API key opens the board tools and the assistant, and boards past the free size. "
                                    "Create one in the Koppar app, under Settings.", 10, colour="ink2", wrap=440),
-                 0, wx.LEFT | wx.RIGHT | wx.TOP, pad // 2)
+                 0, wx.LEFT | wx.RIGHT, pad)
         grid = wx.FlexGridSizer(0, 2, self.FromDIP(10), self.FromDIP(12))
         grid.AddGrowableCol(1)
         grid.Add(text(self, theme, "API key", 9.5, 600, "ink2"), 0, wx.ALIGN_CENTER_VERTICAL)
@@ -1778,6 +2245,14 @@ class AccountDialog(wx.Dialog):
         self.key.SetHint("sc_...")
         grid.Add(self.key, 1, wx.EXPAND)
         root.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, pad)
+        root.Add(text(self, theme, "Updates", 11, 600, family="display"), 0, wx.LEFT | wx.RIGHT | wx.TOP, pad)
+        self.check_updates = Switch(self, theme, "Check for updates automatically", settings.get("check_updates", True))
+        root.AddSpacer(pad // 2)
+        root.Add(self.check_updates, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, pad)
+        self.auto_update = Switch(self, theme, "Install updates automatically", settings.get("auto_update", False),
+                                  hint="A new version takes effect when the PCB editor next starts.")
+        root.AddSpacer(pad // 2)
+        root.Add(self.auto_update, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, pad)
         if cli_login() and not settings.get("api_key"):
             root.Add(text(self, theme, "Using the key of your Koppar CLI login until one is entered here.", 9, colour="muted"),
                      0, wx.LEFT | wx.RIGHT | wx.TOP, pad)
@@ -1800,4 +2275,5 @@ class AccountDialog(wx.Dialog):
         self.EndModal(wx.ID_OK)
 
     def values(self):
-        return {"api_key": self.key.GetValue().strip()}
+        return {"api_key": self.key.GetValue().strip(), "check_updates": self.check_updates.GetValue(),
+                "auto_update": self.auto_update.GetValue()}

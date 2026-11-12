@@ -73,6 +73,19 @@ class Workspace:
             raise ApiError(422, view.get("error") or f"{tool} failed", view)
         return view
 
+    def follow(self, on_progress=None, is_cancelled=None):
+        """Wait for the workspace's running job (one started before the window closed) to end."""
+        view = self.client.wait_board_job(self.design_id)
+        while view.get("status") in ("queued", "running"):
+            if on_progress:
+                on_progress(view.get("progress") or view.get("status"), view.get("elapsed_s"))
+            if is_cancelled and is_cancelled():
+                return view
+            view = self.client.wait_board_job(self.design_id)
+        if view.get("status") == "failed":
+            raise ApiError(422, view.get("error") or "the job failed", view)
+        return view
+
     def fetch(self, route):
         """Download one of the workspace's files into the project's .koppar folder."""
         data = self.client.download_result(self.design_id, route)
@@ -82,3 +95,57 @@ class Workspace:
         with open(dest, "wb") as f:
             f.write(data)
         return dest
+
+
+def route_result(result):
+    """A workspace route's result (route_board's pipeline) in the shape the Autoroute summary
+    reads: {routing: {...}, drc: {errors, unconnected_items, errors_by_type}}."""
+    r = result or {}
+    p = r.get("pipeline") or {}
+    after = p.get("after_route") or {}
+    return {
+        "routing": {
+            "router": (r.get("route") or {}).get("router") or r.get("router"),
+            "route_s": p.get("route_s"),
+            "finish_s": p.get("finish_s"),
+            "open_after_route": after.get("unconnected_items"),
+            "copper_finished": p.get("copper_finishing") == "kept",
+            "capped": bool(p.get("capped")),
+        },
+        "drc": {
+            "errors": r.get("drc_errors"),
+            "unconnected_items": r.get("unconnected_items"),
+            "errors_by_type": r.get("errors_by_type") or {},
+        },
+        "outcome": r.get("outcome"),
+    }
+
+
+def apply_fixes(workspace, fixes, on_stage=None, is_cancelled=None):
+    """The board check's fixes (precheck.fix_plan) on the workspace, before its route.
+
+    The overlapping parts move, and only those (anneal_place with their refs). The copper where
+    they were and where they now are is cleared (ripup_routing of every net in each part's box,
+    0.3 mm around it): a part moved onto routed copper shorted it, and its old tracks led nowhere;
+    the route makes those connections again. Then the stray vias and tracks the check named go."""
+    say = on_stage or (lambda _text: None)
+    move = fixes.get("move") or []
+    if move:
+        def boxes():
+            view = workspace.run("get_board_info", {"refs": move}, is_cancelled=is_cancelled)
+            feet = ((view.get("result") or {}).get("footprints")) or []
+            return [f["box"] for f in feet if f.get("ref") in move and f.get("box")]
+
+        before = boxes()
+        say(f"Moving {', '.join(move[:6])}{' and more' if len(move) > 6 else ''} apart")
+        workspace.run("anneal_place", {"refs": move}, is_cancelled=is_cancelled)
+        say("Clearing the copper where the parts were and where they are now")
+        margin = 0.3
+        for b in before + boxes():
+            workspace.run("ripup_routing", {"region": {
+                "x_mm": b["x_mm"] - margin, "y_mm": b["y_mm"] - margin,
+                "w_mm": b["w_mm"] + 2 * margin, "h_mm": b["h_mm"] + 2 * margin}}, is_cancelled=is_cancelled)
+    for r in fixes.get("rip") or []:
+        say(f"Removing the stray {r.get('kind', 'copper').lower()} of {r['net']}")
+        workspace.run("ripup_routing", {"nets": [r["net"]], "region": {
+            "x_mm": r["x_mm"] - 0.3, "y_mm": r["y_mm"] - 0.3, "w_mm": 0.6, "h_mm": 0.6}}, is_cancelled=is_cancelled)

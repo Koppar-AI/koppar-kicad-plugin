@@ -325,8 +325,7 @@ def _autoroute(r, ctx):
               tile("Server time", f"{round(_n(routing.get('route_s')) + _n(routing.get('finish_s')))} s",
                    "stopped at the time cap" if routing.get("capped") else "")]
     sections = []
-    rows = [("Router", routing.get("router")), ("Winning arm", routing.get("shipped")),
-            ("Copper finishing", "kept" if routing.get("copper_finished") else "not kept"),
+    rows = [("Copper finishing", "kept" if routing.get("copper_finished") else "not kept"),
             ("Open after the first route", routing.get("open_after_route"))]
     sections.append({"title": "Run", "kind": "table", "rows": [(a, _fmt(b)) for a, b in rows if b is not None]})
     if drc.get("errors_by_type"):

@@ -2,7 +2,7 @@
 
 import os
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 # the package identifier in KiCad's Plugin and Content Manager
 PACKAGE_ID = "ai.koppar.kicad"
 
@@ -22,6 +22,10 @@ def servers():
 # one the plugin brought in, when it is made from this link
 API_KEYS_URL = "https://app.koppar.ai/settings?ref=kicad-plugin"
 HOMEPAGE_URL = "https://koppar.ai"
+
+# Koppar's latest release of this plugin ({version, url, sha256, size, notes, min_kicad}), on the
+# tools server
+UPDATE_MANIFEST_PATH = "/api/tools/kicad-plugin/latest"
 
 # the largest board file the server takes
 MAX_BOARD_BYTES = 20 * 1024 * 1024
