@@ -90,6 +90,6 @@ if [ -n "$server" ]; then export KOPPAR_SERVER="$server"; fi
 export XDG_CONFIG_HOME="$work/xdg"
 status=0
 # a session bus of its own: wx waits on one at start, 25 s per try, when there is none
-timeout 1200 dbus-run-session -- env ${KOPPAR_SMOKE_PYTHONHOME:+PYTHONHOME=$KOPPAR_SMOKE_PYTHONHOME} "${prefix:+$prefix/usr/bin/}pcbnew" "$work/board/$stem.kicad_pcb" > "$out/pcbnew.log" 2>&1 || status=$?
+timeout "${KOPPAR_SMOKE_TIMEOUT:-1200}" dbus-run-session -- env ${KOPPAR_SMOKE_PYTHONHOME:+PYTHONHOME=$KOPPAR_SMOKE_PYTHONHOME} "${prefix:+$prefix/usr/bin/}pcbnew" "$work/board/$stem.kicad_pcb" > "$out/pcbnew.log" 2>&1 || status=$?
 echo "pcbnew exit $status; report in $out/report.json"
 exit $status

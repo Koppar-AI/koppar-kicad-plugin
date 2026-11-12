@@ -53,6 +53,14 @@ DEFAULTS = {
     "preserve_existing": True,
     "vias_in_pads": False,
     "import_zones": True,
+    # updates: a check each time the window opens unless switched off; installing on its own only when asked
+    "check_updates": True,
+    "auto_update": False,
+    "last_update_check": 0,
+    # the board check before a route: findings the user chose to route with anyway, per board
+    "check_ack": {},
+    # the newer release the last check found, shown until installed
+    "update_available": None,
 }
 
 

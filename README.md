@@ -46,14 +46,17 @@ Save the board (Koppar keeps its jobs beside the board file), then press **Koppa
 
 - **Pick a task** on the left. Tasks marked with a key need an account
   (**Add API key** in the header).
-- **Options**: the ones that matter, with plain labels. Nets are *All nets*,
+- **Options**: the few that matter, with plain labels. Nets are *All nets*,
   *Not connected*, *Selected in KiCad* (the parts, pads or tracks selected in
-  the editor) or *Pick nets*. Every other option of the task is under
-  **More options**.
+  the editor) or *Pick nets*; placement tasks move *All unlocked parts* or the
+  ones *Selected in KiCad*, and a part locked in KiCad stays where it is. The
+  tools' other settings are for agents, through Koppar's MCP server and CLI.
 - **Run**. The board is sent as it is in the editor, unsaved edits included,
-  with its `.kicad_pro` and `.kicad_dru`, so the router follows your rules and
-  net classes. A progress trace shows where the run is. The window can be
-  closed meanwhile; the button brings the run back. Autoroute can be stopped.
+  with its `.kicad_pro` and `.kicad_dru`. The rules and net classes are the
+  ones in **Board Setup** at that moment, also when they are not saved yet, so
+  the router follows what the editor shows. A progress trace shows where the
+  run is. The window can be closed meanwhile; the button brings the run back.
+  Autoroute can be stopped.
 
   ![A run](docs/screenshots/running.png)
 
@@ -67,8 +70,38 @@ Save the board (Koppar keeps its jobs beside the board file), then press **Koppa
 
   ![Applied](docs/screenshots/applied.png)
 
-Account tasks run on a copy of the board in your Koppar account (**Open in
-Koppar** shows it in the app). Every run first sends the board as it is in the
+### The board check before a route
+
+Before Autoroute, routing selected nets, finishing open nets or repairing
+connections, Koppar runs KiCad's design-rule check on the board (with the
+`kicad-cli` of the KiCad you run, KiCad 8 and later) and stops on what a
+route cannot fix:
+
+- **shorts**: two nets touching, from copper already on the board or from
+  parts placed on each other;
+- **parts on each other**: overlapping courtyards;
+- **net classes a footprint cannot meet**: a class clearance wider than the
+  gap between two pads of the same part, so the route is judged against a rule
+  the part breaks by itself.
+
+![The board check](docs/screenshots/board-check.png)
+
+**Fix and route** (with an account) moves the overlapping parts apart, clears
+the copper around them, removes stray vias and tracks that short a net, and
+then routes, all on the account's copy of the board; locked parts never move.
+**Route anyway** routes the board as it is, and the same findings are not
+asked about again until they change. **Back** returns to the task. Without
+`kicad-cli` the check runs on Koppar's server for accounts, and is skipped
+otherwise; a check that cannot run never stops a route.
+
+### One project per board
+
+Account tasks run on a copy of the board in your Koppar account, one project
+per board file (**Open in Koppar** shows it in the app). With an account,
+Autoroute runs there too, so the run, the board's revisions and the result are
+in the app as well. **Stop** ends the run and leaves the board as it was; a run
+keeps going when the window or KiCad is closed, and the window picks it up
+again when it opens. Every run first sends the board as it is in the
 editor, so a task always works on what you see. The window follows KiCad's
 light or dark theme.
 
@@ -100,11 +133,40 @@ touched.
 KiCad runs action plugins only in the PCB editor, so the new project opens in a
 KiCad of its own rather than in the schematic editor of the open project.
 
+## Updates
+
+Each time the window opens, the plugin asks Koppar in the background whether a
+newer version is out. When one is, an **Update to <version>** button appears in the
+window's header: it downloads the release, checks its size and checksum, keeps
+the installed version beside it (`<plugin folder>.previous`) and installs the
+new one, which runs from the next start of the PCB editor. KiCad's Plugin and
+Content Manager shows the new version too.
+
+Both are in the account dialog (the key button in the header): **Check for
+updates automatically** is on by default; **Install updates automatically** is off
+by default and, when on, installs a newer version as soon as it is found. A copy
+run from a source checkout is never updated: git does that.
+
+## Feedback
+
+**Feedback** in the window's header, and **Tell Koppar about it** under a run
+that failed, open a box for a message to the Koppar team and a rating. Ticking
+**Include the details of the last run** adds the plugin, KiCad and system
+versions, the task, its error (with the Python traceback when the plugin itself
+failed, your home folder written as `~`) and the server's id for the run. The
+box shows those details exactly as they are sent; the board is never part of
+them. With an API key the feedback is sent with your account, so we can answer;
+without one it carries no name.
+
 ## What is sent and kept
 
+The plugin collects nothing on its own: no telemetry and no crash reports.
 The board, its project file and its custom rules go to Koppar's servers
 (`tools.koppar.ai` for Autoroute, `app.koppar.ai` for the account). An Autoroute job and its files are deleted from the server after 24
-hours; account tasks work on a copy of the board kept in your account. On your
+hours; account tasks work on a copy of the board kept in your account. The
+update check sends only the plugin's version, KiCad's version and the
+platform; releases are downloaded from the plugin's GitHub releases. Feedback
+goes only when you send it, with only what the box shows. On your
 machine the plugin writes `<project>/.koppar/` (job records, the board as sent
 and the results; it carries its own `.gitignore`), the new designs you open (in
 the folders you choose) and a settings file with your API key

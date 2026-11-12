@@ -7,8 +7,8 @@ config (never the user's) and starts pcbnew on a private X display. Loaded as
 an action plugin, it drives the Koppar window on a timer the way a person
 would: opens it from its menu entry, picks the task (KOPPAR_SMOKE_TASK, default
 autoroute), sets the net scope (KOPPAR_SMOKE_SCOPE: all, open, pick with
-KOPPAR_SMOKE_NETS) and any server option (KOPPAR_SMOKE_ARGS, JSON, typed into
-All options), runs it, waits for the result, presses Apply, then Edit > Undo.
+KOPPAR_SMOKE_NETS) and any other server option (KOPPAR_SMOKE_ARGS, JSON, added
+to what Run sends), runs it, waits for the result, presses Apply, then Edit > Undo.
 With KOPPAR_SMOKE_REOPEN=1 it closes the window once the result is in and
 reopens it from the button first. KOPPAR_SMOKE_TASK=chat sends
 KOPPAR_SMOKE_MESSAGE to Ask Koppar instead; when the reply starts a new
@@ -68,21 +68,68 @@ def window():
 
 
 def shot(name):
-    """The Koppar window, read by its X id (a frame reads black from the root
-    window when there is no window manager)."""
+    """The Koppar window (the root window when it is not open)."""
     try:
-        from PIL import Image
-
         w = window()
-        target = ["-id", str(w.GetHandle())] if w else ["-root"]
-        raw = subprocess.run(["xwd", *target, "-silent"], capture_output=True, timeout=20).stdout
-        h = struct.unpack(">25I", raw[:100])
-        width, height, bpl, ncolors = h[4], h[5], h[12], h[19]
-        off = h[0] + ncolors * 12
-        img = Image.frombuffer("RGBX", (width, height), raw[off:off + bpl * height], "raw", "BGRX", bpl, 1)
-        img.convert("RGB").save(os.path.join(OUT, f"{name}.png"))
+        path = os.path.join(OUT, f"{name}.png")
+        capture(w, path)
+        if w is not None:
+            editor_too(path)
     except Exception as e:
         log("screenshot failed", name=name, error=str(e))
+
+
+def capture(win, path):
+    """A window's pixels, read by its X id (a frame reads black from the root window when there is
+    no window manager); the root window when `win` is None."""
+    from PIL import Image
+
+    target = ["-id", str(win.GetHandle())] if win is not None else ["-root"]
+    raw = subprocess.run(["xwd", *target, "-silent"], capture_output=True, timeout=20).stdout
+    h = struct.unpack(">25I", raw[:100])
+    width, height, bpl, ncolors = h[4], h[5], h[12], h[19]
+    off = h[0] + ncolors * 12
+    img = Image.frombuffer("RGBX", (width, height), raw[off:off + bpl * height], "raw", "BGRX", bpl, 1)
+    img.convert("RGB").save(path)
+
+
+def editor_too(path):
+    """With KOPPAR_SMOKE_COMPOSE, the PCB editor beside each shot (<shot>.editor.png), for
+    scripts/compose_shots.py."""
+    if os.environ.get("KOPPAR_SMOKE_COMPOSE"):
+        frame = plugin_module("ui").pcb_frame()
+        if frame is not None:
+            capture(frame, path[:-4] + ".editor.png")
+
+
+def identify_and_size(w):
+    """KOPPAR_SMOKE_CLIENT on every request (the server's request log keeps who asked), and the
+    window at KOPPAR_SMOKE_WINDOW (e.g. 1040x900) for screenshots."""
+    client = os.environ.get("KOPPAR_SMOKE_CLIENT")
+    api = plugin_module("api")
+    if client and not getattr(api, "_smoke_client", None):
+        orig = api.urllib.request.Request
+
+        def request(url, data=None, headers=None, method=None):
+            return orig(url, data=data, headers={**(headers or {}), "X-Koppar-Client": client}, method=method)
+        api.urllib.request.Request = request
+        api._smoke_client = client
+    size = os.environ.get("KOPPAR_SMOKE_WINDOW")
+    if size and w is not None:
+        width, height = (int(v) for v in size.split("x"))
+        w.SetSize(w.FromDIP(wx.Size(width, height)))
+        w.Layout()
+    at = os.environ.get("KOPPAR_SMOKE_WINDOW_AT")
+    if at and w is not None:
+        # beside the editor, not over it: X keeps no pixels of a covered window without a window manager
+        w.Move(*(int(v) for v in at.split(",")))
+    if os.environ.get("KOPPAR_SMOKE_COMPOSE") and not getattr(identify_and_size, "fitted", False):
+        # the whole board in view, once the editor's canvas is up (it is by the time the window opens)
+        print("[shots] zoom to fit:", click_menu("Zoom to Fit", True), flush=True)
+        if w is not None:
+            # one step out, so the board clears the window that sits over the editor's right side
+            wx.CallLater(800, lambda: print("[shots] zoom out:", click_menu("Zoom Out", True), flush=True))
+            identify_and_size.fitted = True
 
 
 def board_state():
@@ -146,26 +193,12 @@ def waited(s):
     return time.time() - state["since"] > s
 
 
-def fill_advanced(w, args):
-    """Type server options into All options, as a person would."""
+def add_args(w, args):
+    """Server options beyond the window's own (KOPPAR_SMOKE_ARGS), added to what Run sends."""
     if not args:
         return
-    if w.advanced is None:
-        raise RuntimeError("this task has no All options to type into")
-    for name, prop, kind, widget in w.advanced.fields:
-        if name not in args:
-            continue
-        value = args[name]
-        if kind == "boolean":
-            widget.SetSelection(1 if value else 2)
-        elif kind == "enum":
-            widget.SetSelection([str(v) for v in prop["enum"]].index(str(value)) + 1)
-        elif kind == "strings":
-            widget.SetValue(", ".join(value))
-        elif kind == "json":
-            widget.SetValue(json.dumps(value))
-        else:
-            widget.SetValue(str(value))
+    own = w._arguments
+    w._arguments = lambda task: {**own(task), **args}
 
 
 def tick():
@@ -197,6 +230,7 @@ def step():
             return
         report["before"] = board_state()
         log("plugin loaded", kicad=pcbnew.Version(), before=report["before"])
+        identify_and_size(None)
         click_menu("Koppar")
         phase("window")
     elif p == "window":
@@ -206,6 +240,7 @@ def step():
                 log("window never opened")
                 finish()
             return
+        identify_and_size(w)
         if TASK == "chat":
             if not w._chat_available():
                 if waited(30):
@@ -340,7 +375,7 @@ def step():
             if SCOPE == "pick":
                 w.scope.picked = NETS
             w.scope.set_scope(SCOPE)
-        fill_advanced(w, ARGS)
+        add_args(w, ARGS)
         task = plugin_module("catalog").task(TASK)
         log("task page", args=w._arguments(task), scope=w.scope.count.GetLabel() if w.scope else None)
         shot("1-task")

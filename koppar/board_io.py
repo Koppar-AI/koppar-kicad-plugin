@@ -96,14 +96,32 @@ def project_files(path):
     return out
 
 
-def project_zip(path, board_text):
+def project_payload(board, path):
+    """The project and custom rules that go with the board: the .kicad_pro with the rules as the
+    editor holds them now (rules.py; a Board Setup change not saved yet included), the .kicad_dru
+    as saved. Returns {project, rules, changed: [what the editor changed], note}."""
+    from . import rules as live
+
+    extra = project_files(path)
+    found = live.live_rules(board)
+    project, changed = live.merge_into_project(extra.get("project"), found)
+    out = {"changed": changed, "note": live.stale_rules_note(board, found)}
+    if project:
+        out["project"] = project
+    if extra.get("rules"):
+        out["rules"] = extra["rules"]
+    return out
+
+
+def project_zip(path, board_text, payload=None):
     """The board as it is in the editor with its project and rules, zipped under
-    the board's own name: what an account workspace is created or synced from."""
+    the board's own name: what an account workspace is created or synced from.
+    `payload` (project_payload) carries the editor's rules; without it the saved files go."""
     stem = os.path.splitext(os.path.basename(path))[0]
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr(f"{stem}.kicad_pcb", board_text)
-        extra = project_files(path)
+        extra = payload if payload is not None else project_files(path)
         if "project" in extra:
             z.writestr(f"{stem}.kicad_pro", extra["project"])
         if "rules" in extra:

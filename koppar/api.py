@@ -13,7 +13,7 @@ import sys
 import urllib.error
 import urllib.request
 
-from .config import HTTP_TIMEOUT_S, VERSION
+from .config import HTTP_TIMEOUT_S, UPDATE_MANIFEST_PATH, VERSION
 
 # how long one agent call holds for a board job (the server's ceiling)
 WAIT_S = 55
@@ -230,6 +230,22 @@ class KopparClient:
                     except ValueError:
                         pass
                     buf = ""
+
+    def stop_board_job(self, design_id):
+        """Stop the workspace's running board job (the Stop button of an account route)."""
+        return self.call_tool("stop_board_job", {"design_id": design_id})
+
+    def send_feedback(self, body):
+        """Feedback the user chose to send (feedback.payload). With an API key it is the account's;
+        without one it goes in with no name on it."""
+        return self._request("POST", "/api/tools/feedback", body, timeout=30)
+
+    def plugin_manifest(self):
+        """The latest release ({version, url, sha256, size, notes, min_kicad}). Asked without the
+        API key or the install source: the user agent (plugin, KiCad, platform) is all it sends."""
+        anonymous = KopparClient(self.server)
+        anonymous.user_agent = self.user_agent
+        return anonymous._request("GET", UPDATE_MANIFEST_PATH, timeout=15)
 
     def design_progress(self, design_id):
         """Where a new design stands: {status, stage, board, done, has_project, web_url}."""
